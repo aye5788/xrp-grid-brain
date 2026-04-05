@@ -1,3 +1,9 @@
+import os
+import sys
+
+# Add repo root to Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.pipelines.run_brain import run_pipeline
 from src.pipelines.run_grid import generate_latest_grid
 
