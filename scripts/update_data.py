@@ -21,7 +21,10 @@ def fetch_kraken_ohlc():
     if data.get("error"):
         raise Exception(f"Kraken API error: {data['error']}")
 
-    result = list(data["result"].values())[0]
+    # Kraken returns result with one dynamic pair key + "last"
+    result_keys = [k for k in data["result"].keys() if k != "last"]
+    pair_key = result_keys[0]
+    result = data["result"][pair_key]
 
     df = pd.DataFrame(result, columns=[
         "timestamp", "open", "high", "low", "close",
@@ -56,6 +59,15 @@ def load_existing():
     return df
 
 
+def filter_new_data(existing_df, new_df):
+    last_ts = existing_df["timestamp"].max()
+
+    # Only strictly newer candles
+    df = new_df[new_df["timestamp"] > last_ts].copy()
+
+    return df
+
+
 def drop_incomplete_candle(df):
     """
     Remove the most recent candle if it is not fully closed
@@ -67,7 +79,7 @@ def drop_incomplete_candle(df):
 
     last_ts = df["timestamp"].iloc[-1]
 
-    # Candle is 1h long → must be at least 1h old to be "closed"
+    # Candle is 1 hour long → must be at least 1 hour old to be closed
     if (now - last_ts).total_seconds() < 3600:
         df = df.iloc[:-1]
 
@@ -80,7 +92,10 @@ def merge_and_save(existing_df, new_df):
     df = df.drop_duplicates(subset=["timestamp"])
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    df.to_csv(CSV_PATH, index=False)
+    # Save back using original column name style
+    save_df = df.copy()
+    save_df.rename(columns={"timestamp": "date"}, inplace=True)
+    save_df.to_csv(CSV_PATH, index=False)
 
     return df
 
