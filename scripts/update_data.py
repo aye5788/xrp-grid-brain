@@ -41,15 +41,17 @@ def fetch_kraken_ohlc():
 
 def load_existing():
     df = pd.read_csv(CSV_PATH)
+
+    # Normalize columns
+    df.columns = [c.lower() for c in df.columns]
+
+    if "date" in df.columns:
+        df.rename(columns={"date": "timestamp"}, inplace=True)
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    return df
 
-
-def filter_new_data(existing_df, new_df):
-    last_ts = existing_df["timestamp"].max()
-
-    # Only strictly newer candles
-    df = new_df[new_df["timestamp"] > last_ts].copy()
+    keep_cols = ["timestamp", "open", "high", "low", "close", "volume"]
+    df = df[keep_cols].copy()
 
     return df
 
