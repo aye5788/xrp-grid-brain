@@ -1,8 +1,25 @@
+# Python
 __pycache__/
 *.pyc
-.env
-data/processed/
-data/outputs/
+
+# Virtual env
+.venv/
+
+# Credentials / secrets
+credentials/
+
+# Data
+data/raw/*.csv
+
+# Outputs
 outputs/
-*.parquet
-*.log
+*.csv
+*.json
+
+# Notebooks / snapshots
+*.b64
+*.pdf
+*.txt
+
+# OS / misc
+.DS_Store

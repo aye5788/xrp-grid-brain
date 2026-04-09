@@ -1,314 +1,183 @@
 import math
-from typing import Dict, List, Optional
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+FEE_PCT = 0.002  # 0.20% round-trip estimate
 
 
-def safe_float(value, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
+def clamp(x, low=0.0, high=1.0):
+    return max(low, min(high, x))
 
 
-def estimate_net_per_level(spacing_pct: float, fee_pct: float) -> float:
-    """
-    GoodCrypto-style simplified fee-aware per-level estimate.
+def score_candidate(candidate):
+    spacing_pct = candidate["spacing_pct"]
+    width_pct = candidate["width_pct"]
+    est_profit = candidate["est_profit_per_level"]
+    cluster_conf = candidate.get("cluster_confidence", 0.5)
+    regime = candidate.get("operational_regime", "UNKNOWN")
+    range_pos = candidate.get("range_pos_24", 0.5)
+    atr_pct = candidate.get("atr_pct_14", 0.01)
 
-    Approximation:
-    - gross opportunity per completed buy/sell cycle is roughly spacing_pct
-    - round-trip fee drag is ~ 2 * fee_pct
-    """
-    return spacing_pct - (2.0 * fee_pct)
+    # --- Core profitability reward ---
+    profit_score = est_profit * 100
 
+    # --- Reward sufficient width, but not endlessly ---
+    width_score = min(width_pct * 60, 6.0)
 
-def get_regime_profile(row) -> Dict[str, float]:
-    regime = str(row.get("operational_regime", "NO_TRADE"))
-    risk_mode = str(row.get("risk_mode", "OFF"))
-    confidence = safe_float(row.get("cluster_confidence", 0.0), 0.0)
+    # --- Reward sufficient spacing, but not endlessly ---
+    spacing_score = min(spacing_pct * 80, 5.0)
 
-    # Base profile by regime
-    profiles = {
-        "RANGE_GOOD": {
-            "center_shift": 0.00,
-            "width_mults": [4.0, 5.0, 6.0, 7.0],
-            "levels": [8, 10, 12, 14],
-            "size_penalty": 0.00,
-            "allow_trade": True,
-        },
-        "RANGE_TREND_UP": {
-            "center_shift": 0.10,   # slightly above current price
-            "width_mults": [4.5, 5.5, 6.5, 7.5],
-            "levels": [8, 10, 12],
-            "size_penalty": 0.15,
-            "allow_trade": True,
-        },
-        "RANGE_TREND_DOWN": {
-            "center_shift": -0.10,  # slightly below current price
-            "width_mults": [5.0, 6.0, 7.0, 8.0],
-            "levels": [6, 8, 10],
-            "size_penalty": 0.25,
-            "allow_trade": True,
-        },
-        "TREND": {
-            "center_shift": 0.00,
-            "width_mults": [6.0, 7.0, 8.0],
-            "levels": [6, 8],
-            "size_penalty": 0.50,
-            "allow_trade": False,
-        },
-        "NO_TRADE": {
-            "center_shift": 0.00,
-            "width_mults": [6.0],
-            "levels": [6],
-            "size_penalty": 1.00,
-            "allow_trade": False,
-        },
-    }
+    # --- Confidence reward ---
+    confidence_score = cluster_conf * 4.0
 
-    profile = profiles.get(regime, profiles["NO_TRADE"]).copy()
-
-    # Confidence / risk-mode adjustments
-    if risk_mode == "TRANSITION":
-        profile["width_mults"] = [w + 0.5 for w in profile["width_mults"]]
-        profile["levels"] = [lvl for lvl in profile["levels"] if lvl <= 10]
-        profile["size_penalty"] += 0.20
-    elif risk_mode == "OFF":
-        profile["allow_trade"] = False
-        profile["size_penalty"] += 1.00
-
-    if confidence < 0.55:
-        profile["allow_trade"] = False
-        profile["size_penalty"] += 0.50
-    elif confidence < 0.70:
-        profile["size_penalty"] += 0.15
-
-    profile["confidence"] = confidence
-    profile["regime"] = regime
-    profile["risk_mode"] = risk_mode
-    return profile
-
-
-def generate_grid_candidates(row) -> List[Dict]:
-    price = safe_float(row.get("close"), 0.0)
-    atr_pct = safe_float(row.get("atr_pct_14"), 0.0)
-    range_width_24 = safe_float(row.get("range_width_24"), 0.0)
-    range_pos_24 = safe_float(row.get("range_pos_24"), 0.5)
-    rv_24 = safe_float(row.get("rv_24"), 0.0)
-
-    if price <= 0 or atr_pct <= 0:
-        return []
-
-    profile = get_regime_profile(row)
-    fee_pct = 0.002  # 0.20% per side, conservative placeholder
-
-    # Normalize / bound values
-    range_pos_24 = clamp(range_pos_24, 0.0, 1.0)
-
-    # Use both ATR and realized observed range structure
-    structural_floor = max(atr_pct * 3.0, range_width_24 * 0.50, 0.01)
-    structural_cap = max(atr_pct * 12.0, range_width_24 * 1.50, 0.03)
-
-    candidates: List[Dict] = []
-
-    for width_mult in profile["width_mults"]:
-        raw_width_pct = atr_pct * width_mult
-
-        # Blend raw ATR width with structural floor/cap
-        width_pct = clamp(raw_width_pct, structural_floor, structural_cap)
-
-        # Center shift relative to full width
-        center_shift_pct = profile["center_shift"] * width_pct
-
-        # Mild additional adjustment based on where price sits in recent range
-        # If price is already high in range, bias center down a touch; vice versa.
-        structural_center_adjust = (0.5 - range_pos_24) * 0.20 * width_pct
-
-        center_price = price * (1.0 + center_shift_pct + structural_center_adjust)
-
-        grid_lower = center_price * (1.0 - width_pct / 2.0)
-        grid_upper = center_price * (1.0 + width_pct / 2.0)
-
-        if grid_lower <= 0 or grid_upper <= grid_lower:
-            continue
-
-        for levels in profile["levels"]:
-            intervals = max(levels - 1, 1)
-            spacing_abs = (grid_upper - grid_lower) / intervals
-            spacing_pct = spacing_abs / price
-
-            est_profit_per_level = estimate_net_per_level(
-                spacing_pct=spacing_pct,
-                fee_pct=fee_pct,
-            )
-
-            candidate = {
-                "grid_lower": grid_lower,
-                "grid_upper": grid_upper,
-                "levels": int(levels),
-                "spacing": spacing_abs,
-                "spacing_pct": spacing_pct,
-                "width_pct": width_pct,
-                "center_price": center_price,
-                "center_shift_pct": center_shift_pct + structural_center_adjust,
-                "fee_pct": fee_pct,
-                "est_profit_per_level": est_profit_per_level,
-                "regime": profile["regime"],
-                "risk_mode": profile["risk_mode"],
-                "cluster_confidence": profile["confidence"],
-                "size_penalty": profile["size_penalty"],
-                "range_pos_24": range_pos_24,
-                "rv_24": rv_24,
-                "atr_pct_14": atr_pct,
-            }
-            candidates.append(candidate)
-
-    return candidates
-
-
-def candidate_is_viable(candidate: Dict, row) -> bool:
-    regime = str(candidate["regime"])
-    risk_mode = str(candidate["risk_mode"])
-    confidence = safe_float(candidate["cluster_confidence"], 0.0)
-
-    spacing_pct = safe_float(candidate["spacing_pct"], 0.0)
-    width_pct = safe_float(candidate["width_pct"], 0.0)
-    levels = int(candidate["levels"])
-    est_profit = safe_float(candidate["est_profit_per_level"], -999.0)
-    atr_pct = safe_float(candidate["atr_pct_14"], 0.0)
-
-    if regime == "NO_TRADE":
-        return False
-
-    if risk_mode == "OFF":
-        return False
-
-    if confidence < 0.55:
-        return False
-
-    # Must beat fees by a meaningful margin, not just barely positive
-    if est_profit <= 0.0010:
-        return False
-
-    # Avoid absurdly tight / wide grids
-    if spacing_pct < max(atr_pct * 0.40, 0.0025):
-        return False
-
-    if width_pct < max(atr_pct * 3.0, 0.01):
-        return False
-
-    if width_pct > max(atr_pct * 14.0, 0.12):
-        return False
-
-    if levels < 6 or levels > 14:
-        return False
-
-    return True
-
-
-def score_candidate(candidate: Dict, row) -> float:
-    """
-    Higher is better.
-    This is a policy-aware live-selection score, not a hindsight optimizer.
-    """
-    confidence = safe_float(candidate["cluster_confidence"], 0.0)
-    regime = str(candidate["regime"])
-    risk_mode = str(candidate["risk_mode"])
-
-    est_profit = safe_float(candidate["est_profit_per_level"], -999.0)
-    spacing_pct = safe_float(candidate["spacing_pct"], 0.0)
-    width_pct = safe_float(candidate["width_pct"], 0.0)
-    levels = int(candidate["levels"])
-    size_penalty = safe_float(candidate["size_penalty"], 0.0)
-
-    atr_pct = safe_float(row.get("atr_pct_14"), 0.0)
-    range_width_24 = safe_float(row.get("range_width_24"), 0.0)
-
-    # Favor profitable grids that are not too cramped.
-    profit_score = est_profit * 1000.0
-    spacing_score = spacing_pct * 250.0
-
-    # Want width to be roughly aligned with current structure, not too extreme.
-    target_width = max(atr_pct * 6.0, range_width_24 * 0.9, 0.02)
-    width_deviation_penalty = abs(width_pct - target_width) * 120.0
-
-    # Mild preference against excessive levels when uncertain.
-    level_penalty = 0.0
-    if confidence < 0.75:
-        level_penalty += max(levels - 10, 0) * 0.20
-    if risk_mode == "TRANSITION":
-        level_penalty += max(levels - 8, 0) * 0.25
-
-    # Regime preference
+    # --- Regime reward ---
     regime_bonus_map = {
-        "RANGE_GOOD": 2.50,
-        "RANGE_TREND_UP": 1.50,
-        "RANGE_TREND_DOWN": 1.10,
-        "TREND": -2.00,
-        "NO_TRADE": -10.00,
+        "RANGE_GOOD": 4.0,
+        "RANGE_TREND_UP": 2.5,
+        "RANGE_TREND_DOWN": 2.5,
+        "TREND": 1.0,
+        "NO_TRADE": -3.0,
     }
-    regime_bonus = regime_bonus_map.get(regime, -5.0)
+    regime_score = regime_bonus_map.get(regime, 0.0)
 
-    # Confidence helps, uncertainty hurts
-    confidence_bonus = confidence * 4.0
+    # --- Penalize if center is too close to edges of recent range ---
+    edge_penalty = 0.0
+    if range_pos < 0.12 or range_pos > 0.88:
+        edge_penalty = -1.5
 
-    # Penalize aggression in weak states
-    penalty = width_deviation_penalty + level_penalty + (size_penalty * 2.0)
+    # =========================================================
+    # NEW: ACTIVITY / PRODUCTIVITY REWARD
+    # =========================================================
+    #
+    # Goal:
+    # - avoid always picking the widest / safest grid
+    # - reward grids that are likely to actually trade
+    #
+    # Idea:
+    # - spacing should be comfortably above fee threshold
+    # - but not so huge that fills become sparse
+    # - width should be enough to survive
+    # - but not so huge that the bot becomes lazy
+    #
+    # These "ideal zones" can be tuned later.
+    #
 
-    score = (
-        profit_score
-        + spacing_score
-        + regime_bonus
-        + confidence_bonus
-        - penalty
+    # Ideal spacing zone for XRP hourly grid behavior
+    ideal_spacing_center = 0.020   # 2.0%
+    ideal_spacing_tolerance = 0.010  # ±1.0%
+
+    spacing_distance = abs(spacing_pct - ideal_spacing_center)
+    spacing_activity_score = max(
+        0.0,
+        3.0 * (1 - (spacing_distance / ideal_spacing_tolerance))
     )
-    return score
+
+    # Ideal width zone
+    ideal_width_center = 0.10   # 10%
+    ideal_width_tolerance = 0.04  # ±4%
+
+    width_distance = abs(width_pct - ideal_width_center)
+    width_activity_score = max(
+        0.0,
+        3.0 * (1 - (width_distance / ideal_width_tolerance))
+    )
+
+    activity_score = spacing_activity_score + width_activity_score
+
+    # --- Mild ATR alignment reward ---
+    atr_alignment = 0.0
+    if 0.008 <= atr_pct <= 0.018:
+        atr_alignment = 1.0
+
+    # --- Final score ---
+    candidate_score = (
+        profit_score
+        + width_score
+        + spacing_score
+        + confidence_score
+        + regime_score
+        + activity_score
+        + atr_alignment
+        + edge_penalty
+    )
+
+    candidate["candidate_score"] = round(candidate_score, 6)
+    return candidate
 
 
-def build_grid(row) -> Dict:
-    candidates = generate_grid_candidates(row)
+def build_grid_variants(row):
+    close = row["close"]
+    atr = row["atr_14"]
+    regime = row.get("operational_regime", "UNKNOWN")
 
-    if not candidates:
-        return {
-            "grid_lower": None,
-            "grid_upper": None,
-            "levels": 0,
-            "spacing": None,
-            "spacing_pct": None,
-            "width_pct": None,
-            "fee_pct": 0.002,
-            "est_profit_per_level": None,
-            "candidate_score": None,
-            "tradable": False,
-            "selection_reason": "no_candidates_generated",
+    # Base adaptive width multiplier by regime
+    if regime == "RANGE_GOOD":
+        width_mult = 5.0
+    elif regime in ["RANGE_TREND_UP", "RANGE_TREND_DOWN"]:
+        width_mult = 4.5
+    elif regime == "TREND":
+        width_mult = 4.0
+    else:
+        width_mult = 3.5
+
+    center_price = close * (1 - 0.003)
+
+    variants = [
+        ("tight", 0.90),
+        ("base", 1.00),
+        ("wide", 1.12),
+    ]
+
+    candidate_rows = []
+
+    for variant_label, width_scalar in variants:
+        width = atr * width_mult * width_scalar
+        grid_lower = center_price - width
+        grid_upper = center_price + width
+        levels = 6
+
+        spacing = (grid_upper - grid_lower) / (levels - 1)
+        spacing_pct = spacing / center_price
+        width_pct = (grid_upper - grid_lower) / center_price
+
+        est_profit_per_level = spacing_pct - FEE_PCT
+        tradable = est_profit_per_level > 0.003  # still preserve GoodCrypto-style minimum edge
+
+        candidate = {
+            **row.to_dict(),
+            "grid_lower": grid_lower,
+            "grid_upper": grid_upper,
+            "levels": levels,
+            "spacing": spacing,
+            "spacing_pct": spacing_pct,
+            "width_pct": width_pct,
+            "center_price": center_price,
+            "center_shift_pct": -0.003,
+            "fee_pct": FEE_PCT,
+            "est_profit_per_level": est_profit_per_level,
+            "regime": regime,
+            "size_penalty": 0.0,
+            "tradable": tradable,
+            "selection_reason": f"adaptive_geometry_v2_{variant_label}",
+            "variant_label": variant_label,
         }
 
-    viable_candidates = [c for c in candidates if candidate_is_viable(c, row)]
+        candidate = score_candidate(candidate)
+        candidate_rows.append(candidate)
 
-    if not viable_candidates:
-        # Fall back to best non-viable candidate, but mark not tradable.
-        scored = []
-        for c in candidates:
-            c = c.copy()
-            c["candidate_score"] = score_candidate(c, row)
-            scored.append(c)
+    return candidate_rows
 
-        best = max(scored, key=lambda x: x["candidate_score"])
-        best["tradable"] = False
-        best["selection_reason"] = "best_non_viable_candidate"
-        return best
 
-    scored_viable = []
-    for c in viable_candidates:
-        c = c.copy()
-        c["candidate_score"] = score_candidate(c, row)
-        scored_viable.append(c)
+def build_grid(row):
+    """
+    Backward-compatible helper:
+    returns the single best candidate for legacy callers.
+    """
+    candidates = build_grid_variants(row)
+    tradable_candidates = [c for c in candidates if c["tradable"]]
 
-    best = max(scored_viable, key=lambda x: x["candidate_score"])
-    best["tradable"] = True
-    best["selection_reason"] = "best_viable_candidate"
+    if tradable_candidates:
+        best = max(tradable_candidates, key=lambda x: x["candidate_score"])
+    else:
+        best = max(candidates, key=lambda x: x["candidate_score"])
+
     return best
