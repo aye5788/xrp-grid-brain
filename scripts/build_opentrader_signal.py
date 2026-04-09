@@ -1,97 +1,113 @@
-import pandas as pd
 import json
-from pathlib import Path
-
-DECISION_PATH = "outputs/latest_decision.csv"
-LIFECYCLE_PATH = "outputs/lifecycle_decision.csv"
-
-OUTPUT_JSON = "outputs/opentrader_signal.json"
-OUTPUT_CSV = "outputs/opentrader_signal.csv"
+import os
+from datetime import datetime, timezone
 
 
-def load_inputs():
-    if not Path(DECISION_PATH).exists():
-        raise FileNotFoundError(f"Missing: {DECISION_PATH}")
-    if not Path(LIFECYCLE_PATH).exists():
-        raise FileNotFoundError(f"Missing: {LIFECYCLE_PATH}")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    decision = pd.read_csv(DECISION_PATH)
-    lifecycle = pd.read_csv(LIFECYCLE_PATH)
+LIFECYCLE_PATH = os.path.join(BASE_DIR, "outputs", "lifecycle_decision.json")
+ACTIVE_GRID_PATH = os.path.join(BASE_DIR, "outputs", "active_grid.json")
+EXEC_STATE_PATH = os.path.join(BASE_DIR, "outputs", "execution_state.json")
 
-    if decision.empty:
-        raise ValueError("latest_decision.csv is empty")
-    if lifecycle.empty:
-        raise ValueError("lifecycle_decision.csv is empty")
-
-    return decision.iloc[0], lifecycle.iloc[0]
+OUTPUT_JSON = os.path.join(BASE_DIR, "outputs", "opentrader_signal.json")
+OUTPUT_CSV = os.path.join(BASE_DIR, "outputs", "opentrader_signal.csv")
 
 
-def determine_opentrader_action(decision, lifecycle):
-    tradable = bool(decision.get("tradable", False))
-    lifecycle_action = str(lifecycle.get("lifecycle_action", "UNKNOWN")).upper()
-
-    if not tradable:
-        return "NO_ACTION", "brain_marked_not_tradable"
-
-    if lifecycle_action == "HOLD":
-        return "DEPLOY_OR_MAINTAIN_GRID", "tradable_and_lifecycle_hold"
-
-    if lifecycle_action == "RECENTER":
-        return "RECENTER_GRID", "lifecycle_requested_recenter"
-
-    if lifecycle_action == "REPLACE":
-        return "REPLACE_GRID", "lifecycle_requested_replace"
-
-    if lifecycle_action == "EXIT":
-        return "CLOSE_GRID", "lifecycle_requested_exit"
-
-    return "NO_ACTION", "unrecognized_lifecycle_state"
+STALE_SECONDS = 300  # 5 minutes
 
 
-def build_payload(decision, lifecycle):
-    action, reason = determine_opentrader_action(decision, lifecycle)
-
-    payload = {
-        "timestamp": str(pd.Timestamp.utcnow()),
-        "symbol": "XRP/USD",
-        "adapter_action": action,
-        "adapter_reason": reason,
-
-        "lifecycle_action": lifecycle.get("lifecycle_action"),
-        "lifecycle_reason": lifecycle.get("reason"),
-
-        "tradable": bool(decision.get("tradable", False)),
-        "candidate_score": float(decision.get("candidate_score", 0)),
-        "operational_regime": decision.get("operational_regime"),
-        "risk_mode": decision.get("risk_mode"),
-
-        "grid_lower": float(decision.get("grid_lower")),
-        "grid_upper": float(decision.get("grid_upper")),
-        "center_price": float(decision.get("center_price")),
-        "levels": int(decision.get("levels")),
-        "spacing": float(decision.get("spacing")),
-        "spacing_pct": float(decision.get("spacing_pct")),
-        "width_pct": float(decision.get("width_pct")),
-        "fee_pct": float(decision.get("fee_pct")),
-        "est_profit_per_level": float(decision.get("est_profit_per_level")),
-    }
-
-    return payload
+def load_json(path):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
-def save_outputs(payload):
-    with open(OUTPUT_JSON, "w") as f:
-        json.dump(payload, f, indent=2)
+def is_state_stale(exec_state):
+    try:
+        ts = datetime.fromisoformat(exec_state["last_sync_ts"].replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return (now - ts).total_seconds() > STALE_SECONDS
+    except Exception:
+        return True
 
-    pd.DataFrame([payload]).to_csv(OUTPUT_CSV, index=False)
+
+def state_conflicts(exec_state, local_state):
+    try:
+        if not local_state:
+            return False
+
+        lower_local = local_state.get("grid_lower")
+        upper_local = local_state.get("grid_upper")
+
+        lower_live = exec_state.get("live_grid_lower")
+        upper_live = exec_state.get("live_grid_upper")
+
+        if lower_local is None or upper_local is None:
+            return False
+
+        return (
+            abs(lower_local - lower_live) > 1e-6 or
+            abs(upper_local - upper_live) > 1e-6
+        )
+    except Exception:
+        return True
 
 
 def main():
-    decision, lifecycle = load_inputs()
-    payload = build_payload(decision, lifecycle)
-    save_outputs(payload)
+    lifecycle = load_json(LIFECYCLE_PATH)
+    active_grid = load_json(ACTIVE_GRID_PATH)
+    exec_state = load_json(EXEC_STATE_PATH)
 
-    print(f"OpenTrader signal → {payload['adapter_action']} ({payload['adapter_reason']})")
+    if not lifecycle:
+        raise ValueError("Missing lifecycle_decision.json")
+
+    lifecycle_action = lifecycle.get("lifecycle_action", "UNKNOWN")
+    tradable = lifecycle.get("tradable", True)
+
+    # -----------------------------------
+    # DEFAULT ACTION
+    # -----------------------------------
+    adapter_action = "DEPLOY_OR_MAINTAIN_GRID"
+    adapter_reason = "tradable_and_lifecycle_hold"
+
+    # -----------------------------------
+    # APPLY LIFECYCLE LOGIC
+    # -----------------------------------
+    if not tradable:
+        adapter_action = "NO_ACTION"
+        adapter_reason = "not_tradable"
+
+    elif lifecycle_action in ["REPLACE", "RECENTER", "EXIT"]:
+        adapter_action = lifecycle_action + "_GRID"
+        adapter_reason = "lifecycle_trigger"
+
+    # -----------------------------------
+    # EXECUTION RECONCILIATION GUARD
+    # -----------------------------------
+    if exec_state:
+        if is_state_stale(exec_state):
+            adapter_action = "NO_ACTION"
+            adapter_reason = "STATE_UNCERTAIN_STALE"
+
+        elif state_conflicts(exec_state, active_grid):
+            adapter_action = "NO_ACTION"
+            adapter_reason = "STATE_UNCERTAIN_CONFLICT"
+
+    # -----------------------------------
+    # OUTPUT
+    # -----------------------------------
+    output = {
+        "adapter_action": adapter_action,
+        "adapter_reason": adapter_reason,
+        "lifecycle_action": lifecycle_action
+    }
+
+    with open(OUTPUT_JSON, "w") as f:
+        json.dump(output, f, indent=2)
+
+    print(f"OpenTrader signal → {adapter_action} ({adapter_reason})")
 
 
 if __name__ == "__main__":

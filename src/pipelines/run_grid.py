@@ -21,9 +21,17 @@ def generate_latest_grid(df):
 
     candidates = []
 
+    error_count = 0
+    row_count = 0
+
     for _, row in recent.iterrows():
+        row_count += 1
+
         try:
             row_candidates = build_grid_variants(row)
+
+            if not row_candidates:
+                continue
 
             for candidate in row_candidates:
                 combined = {
@@ -32,11 +40,22 @@ def generate_latest_grid(df):
                 }
                 candidates.append(combined)
 
-        except Exception:
-            continue
+        except Exception as e:
+            error_count += 1
+            print(f"[WARN] Candidate build failed at row {row['timestamp']}: {e}")
 
     if not candidates:
         raise ValueError("No valid grid candidates generated.")
+
+    # -----------------------------------
+    # ERROR RATE CHECK
+    # -----------------------------------
+    if row_count > 0:
+        error_rate = error_count / row_count
+        print(f"[INFO] Candidate build error rate: {error_rate:.2%} ({error_count}/{row_count})")
+
+        if error_rate > 0.25:
+            raise RuntimeError(f"Candidate generation error rate too high: {error_rate:.2%}")
 
     pool_df = pd.DataFrame(candidates)
 

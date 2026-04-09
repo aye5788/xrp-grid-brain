@@ -1,9 +1,10 @@
 import requests
 import pandas as pd
 from datetime import datetime, timezone
+import os
 
-CSV_PATH = "data/raw/xrp_full_hourly_clean.csv"
-
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CSV_PATH = os.path.join(BASE_DIR, "data", "raw", "xrp_full_hourly_clean.csv")
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 PAIR = "XRPUSD"
 INTERVAL = 60  # minutes

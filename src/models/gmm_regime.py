@@ -16,6 +16,9 @@ FEATURE_COLS = [
 ]
 
 
+# -----------------------------------
+# FIT
+# -----------------------------------
 def fit_gmm(df: pd.DataFrame, n_components=5):
     X = df[FEATURE_COLS].values
 
@@ -31,6 +34,45 @@ def fit_gmm(df: pd.DataFrame, n_components=5):
     return gmm, scaler
 
 
+# -----------------------------------
+# CANONICALIZATION LOGIC
+# -----------------------------------
+def build_cluster_canonical_map(df: pd.DataFrame):
+    """
+    Assign stable semantic meaning to clusters based on interpretable metrics
+    """
+    cluster_stats = (
+        df.groupby("regime_cluster")[["rv_24", "range_width_24", "ret_24"]]
+        .mean()
+        .reset_index()
+    )
+
+    # Sort clusters by volatility (rv_24)
+    cluster_stats = cluster_stats.sort_values("rv_24").reset_index(drop=True)
+
+    canonical_map = {}
+
+    for i, row in cluster_stats.iterrows():
+        cluster_id = int(row["regime_cluster"])
+
+        # LOW VOL clusters first → RANGE types
+        if i == 0:
+            canonical_map[cluster_id] = 0  # RANGE_GOOD
+        elif i == 1:
+            canonical_map[cluster_id] = 1  # RANGE_TREND_UP
+        elif i == 2:
+            canonical_map[cluster_id] = 2  # RANGE_TREND_DOWN
+        elif i == 3:
+            canonical_map[cluster_id] = 3  # TREND
+        else:
+            canonical_map[cluster_id] = 4  # NO_TRADE
+
+    return canonical_map
+
+
+# -----------------------------------
+# ASSIGN
+# -----------------------------------
 def assign_clusters(df, gmm, scaler):
     X = df[FEATURE_COLS].values
     X_scaled = scaler.transform(X)
@@ -39,7 +81,14 @@ def assign_clusters(df, gmm, scaler):
     probs = gmm.predict_proba(X_scaled)
 
     df = df.copy()
-    df["regime_cluster"] = clusters
+    df["regime_cluster_raw"] = clusters
     df["cluster_confidence"] = probs.max(axis=1)
+
+    # Build canonical mapping from full dataset
+    df["regime_cluster"] = df["regime_cluster_raw"]
+    canonical_map = build_cluster_canonical_map(df)
+
+    # Apply canonical mapping
+    df["regime_cluster"] = df["regime_cluster_raw"].map(canonical_map)
 
     return df
