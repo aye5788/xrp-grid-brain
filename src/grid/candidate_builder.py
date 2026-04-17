@@ -1,11 +1,20 @@
 import math
+import json
+import os
+
+FEE_PCT = 0.002
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ADAPTIVE_PARAMS_PATH = os.path.join(BASE_DIR, "outputs", "adaptive_params.json")
 
 
-FEE_PCT = 0.002  # 0.20% round-trip estimate
-
-
-def clamp(x, low=0.0, high=1.0):
-    return max(low, min(high, x))
+def load_width_scale():
+    try:
+        with open(ADAPTIVE_PARAMS_PATH, "r") as f:
+            params = json.load(f)
+            return float(params.get("width_scale", 1.0))
+    except Exception:
+        return 1.0
 
 
 def score_candidate(candidate):
@@ -17,19 +26,11 @@ def score_candidate(candidate):
     range_pos = candidate.get("range_pos_24", 0.5)
     atr_pct = candidate.get("atr_pct_14", 0.01)
 
-    # --- Core profitability reward ---
     profit_score = est_profit * 100
-
-    # --- Reward sufficient width, but not endlessly ---
     width_score = min(width_pct * 60, 6.0)
-
-    # --- Reward sufficient spacing, but not endlessly ---
     spacing_score = min(spacing_pct * 80, 5.0)
-
-    # --- Confidence reward ---
     confidence_score = cluster_conf * 4.0
 
-    # --- Regime reward ---
     regime_bonus_map = {
         "RANGE_GOOD": 4.0,
         "RANGE_TREND_UP": 2.5,
@@ -39,56 +40,24 @@ def score_candidate(candidate):
     }
     regime_score = regime_bonus_map.get(regime, 0.0)
 
-    # --- Penalize if center is too close to edges of recent range ---
-    edge_penalty = 0.0
-    if range_pos < 0.12 or range_pos > 0.88:
-        edge_penalty = -1.5
+    edge_penalty = -1.5 if (range_pos < 0.12 or range_pos > 0.88) else 0.0
 
-    # =========================================================
-    # NEW: ACTIVITY / PRODUCTIVITY REWARD
-    # =========================================================
-    #
-    # Goal:
-    # - avoid always picking the widest / safest grid
-    # - reward grids that are likely to actually trade
-    #
-    # Idea:
-    # - spacing should be comfortably above fee threshold
-    # - but not so huge that fills become sparse
-    # - width should be enough to survive
-    # - but not so huge that the bot becomes lazy
-    #
-    # These "ideal zones" can be tuned later.
-    #
-
-    # Ideal spacing zone for XRP hourly grid behavior
-    ideal_spacing_center = 0.020   # 2.0%
-    ideal_spacing_tolerance = 0.010  # ±1.0%
+    ideal_spacing_center = 0.020
+    ideal_spacing_tolerance = 0.010
 
     spacing_distance = abs(spacing_pct - ideal_spacing_center)
-    spacing_activity_score = max(
-        0.0,
-        3.0 * (1 - (spacing_distance / ideal_spacing_tolerance))
-    )
+    spacing_activity_score = max(0.0, 3.0 * (1 - (spacing_distance / ideal_spacing_tolerance)))
 
-    # Ideal width zone
-    ideal_width_center = 0.10   # 10%
-    ideal_width_tolerance = 0.04  # ±4%
+    ideal_width_center = 0.10
+    ideal_width_tolerance = 0.04
 
     width_distance = abs(width_pct - ideal_width_center)
-    width_activity_score = max(
-        0.0,
-        3.0 * (1 - (width_distance / ideal_width_tolerance))
-    )
+    width_activity_score = max(0.0, 3.0 * (1 - (width_distance / ideal_width_tolerance)))
 
     activity_score = spacing_activity_score + width_activity_score
 
-    # --- Mild ATR alignment reward ---
-    atr_alignment = 0.0
-    if 0.008 <= atr_pct <= 0.018:
-        atr_alignment = 1.0
+    atr_alignment = 1.0 if 0.008 <= atr_pct <= 0.018 else 0.0
 
-    # --- Final score ---
     candidate_score = (
         profit_score
         + width_score
@@ -109,15 +78,16 @@ def build_grid_variants(row):
     atr = row["atr_14"]
     regime = row.get("operational_regime", "UNKNOWN")
 
-    # Base adaptive width multiplier by regime
+    width_scale = load_width_scale()
+
     if regime == "RANGE_GOOD":
-        width_mult = 5.0
+        width_mult = 5.0 * width_scale
     elif regime in ["RANGE_TREND_UP", "RANGE_TREND_DOWN"]:
-        width_mult = 4.5
+        width_mult = 4.5 * width_scale
     elif regime == "TREND":
-        width_mult = 4.0
+        width_mult = 4.0 * width_scale
     else:
-        width_mult = 3.5
+        width_mult = 3.5 * width_scale
 
     center_price = close * (1 - 0.003)
 
@@ -140,7 +110,7 @@ def build_grid_variants(row):
         width_pct = (grid_upper - grid_lower) / center_price
 
         est_profit_per_level = spacing_pct - FEE_PCT
-        tradable = est_profit_per_level > 0.003  # still preserve GoodCrypto-style minimum edge
+        tradable = est_profit_per_level > 0.003
 
         candidate = {
             **row.to_dict(),
@@ -165,19 +135,3 @@ def build_grid_variants(row):
         candidate_rows.append(candidate)
 
     return candidate_rows
-
-
-def build_grid(row):
-    """
-    Backward-compatible helper:
-    returns the single best candidate for legacy callers.
-    """
-    candidates = build_grid_variants(row)
-    tradable_candidates = [c for c in candidates if c["tradable"]]
-
-    if tradable_candidates:
-        best = max(tradable_candidates, key=lambda x: x["candidate_score"])
-    else:
-        best = max(candidates, key=lambda x: x["candidate_score"])
-
-    return best

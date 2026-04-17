@@ -58,10 +58,11 @@ def build_cluster_canonical_map(df: pd.DataFrame):
         # LOW VOL clusters first → RANGE types
         if i == 0:
             canonical_map[cluster_id] = 0  # RANGE_GOOD
-        elif i == 1:
-            canonical_map[cluster_id] = 1  # RANGE_TREND_UP
-        elif i == 2:
-            canonical_map[cluster_id] = 2  # RANGE_TREND_DOWN
+        elif i in (1, 2):
+            # Disambiguate directional RANGE regimes by mean ret_24 sign rather
+            # than rank order. Rank order alone can swap UP/DOWN between retrains
+            # when two clusters have similar volatility but opposite direction.
+            canonical_map[cluster_id] = 1 if row["ret_24"] >= 0 else 2
         elif i == 3:
             canonical_map[cluster_id] = 3  # TREND
         else:

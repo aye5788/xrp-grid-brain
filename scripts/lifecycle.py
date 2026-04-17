@@ -1,6 +1,12 @@
 import pandas as pd
 import json
+import os
+import sys
 from pathlib import Path
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from src.control.control_layer import apply as control_apply
+from src.control.economic_guard import check_economic_override, load_paper_summary
 
 # -----------------------------
 # Paths
@@ -13,6 +19,21 @@ ACTIVE_GRID_PATH = "outputs/active_grid.json"
 
 OUTPUT_JSON = "outputs/lifecycle_decision.json"
 OUTPUT_CSV = "outputs/lifecycle_decision.csv"
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ADAPTIVE_PARAMS_PATH = os.path.join(BASE_DIR, "outputs", "adaptive_params.json")
+
+
+# -----------------------------
+# Adaptive params
+# -----------------------------
+def load_adaptive_threshold():
+    try:
+        with open(ADAPTIVE_PARAMS_PATH, "r") as f:
+            params = json.load(f)
+            return float(params.get("initiation_score_threshold", 12.0))
+    except Exception:
+        return 12.0
 
 
 # -----------------------------
@@ -67,62 +88,19 @@ def save_active_grid(active_grid):
 
 
 def clear_active_grid():
+    now = str(pd.Timestamp.utcnow())
     inactive_payload = {
         "active": False,
         "status": "INACTIVE",
-        "last_updated": str(pd.Timestamp.utcnow())
+        "last_updated": now,
+        "last_exit_ts": now,   # read by control_layer for reentry cooldown
     }
     with open(ACTIVE_GRID_PATH, "w") as f:
         json.dump(inactive_payload, f, indent=2)
 
 
 # -----------------------------
-# Decision history updater
-# -----------------------------
-def attach_lifecycle_to_decision_history(candidate, output):
-    if not Path(DECISION_HISTORY_PATH).exists():
-        print(f"Decision history not found, skipping lifecycle attach: {DECISION_HISTORY_PATH}")
-        return
-
-    df = pd.read_csv(DECISION_HISTORY_PATH)
-
-    if df.empty:
-        print("Decision history is empty, skipping lifecycle attach.")
-        return
-
-    if "timestamp" not in df.columns and "date" in df.columns:
-        df = df.rename(columns={"date": "timestamp"})
-
-    if "timestamp" not in df.columns:
-        print("Decision history missing timestamp column, skipping lifecycle attach.")
-        return
-
-    # Ensure lifecycle columns exist
-    for col in ["lifecycle_mode", "lifecycle_action", "lifecycle_reason"]:
-        if col not in df.columns:
-            df[col] = None
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    candidate_ts = pd.to_datetime(candidate["timestamp"], utc=True)
-
-    matches = df.index[df["timestamp"] == candidate_ts].tolist()
-
-    if not matches:
-        print(f"No matching decision_history row found for timestamp {candidate_ts}.")
-        return
-
-    idx = matches[-1]
-
-    df.at[idx, "lifecycle_mode"] = output["mode"]
-    df.at[idx, "lifecycle_action"] = output["lifecycle_action"]
-    df.at[idx, "lifecycle_reason"] = output["reason"]
-
-    df.to_csv(DECISION_HISTORY_PATH, index=False)
-    print(f"Attached lifecycle fields to decision_history row: {candidate_ts}")
-
-
-# -----------------------------
-# Initiation logic
+# Initiation logic (unchanged)
 # -----------------------------
 def determine_initiation_action(candidate, price):
     score = float(candidate["candidate_score"])
@@ -131,232 +109,229 @@ def determine_initiation_action(candidate, price):
     upper = float(candidate["grid_upper"])
     center = float(candidate["center_price"])
 
-    # Candidate should at least still make geometric sense
+    threshold = load_adaptive_threshold()
+
     if not (lower < upper):
         return "BLOCK", "invalid_candidate_geometry"
 
-    # Candidate too weak
-    if score < 7:
-        return "WAIT", "candidate_score_below_threshold"
+    if score < threshold:
+        return "WAIT", f"candidate_score_below_threshold_{threshold}"
 
-    # Avoid initiating if already clearly outside proposed structure
     if price < lower * 0.995 or price > upper * 1.005:
         return "WAIT", "price_already_far_from_candidate_structure"
 
-    # Distance from center (avoid stretched entries)
     distance_from_center = abs(price - center) / center
 
-    # Best-case regime
     if regime == "RANGE_GOOD" and score >= 8 and distance_from_center <= 0.01:
         return "INITIATE", "strong_range_candidate"
 
-    # Acceptable but more cautious regime
     if regime == "RANGE_TREND_UP" and score >= 9 and distance_from_center <= 0.008:
         return "INITIATE", "high_quality_range_trend_up_candidate"
 
-    # Everything else waits for now
     return "WAIT", "context_not_strong_enough_to_initiate"
 
 
 # -----------------------------
-# Maintenance logic
+# IMPROVED maintenance logic
 # -----------------------------
 def determine_maintenance_action(active_grid, candidate, price):
     lower = float(active_grid["grid_lower"])
     upper = float(active_grid["grid_upper"])
     center = float(active_grid["center_price"])
+
     active_score = float(active_grid["candidate_score"])
-    active_regime = active_grid["operational_regime"]
-
     candidate_score = float(candidate["candidate_score"])
-    candidate_regime = candidate["operational_regime"]
 
-    # Distance from active grid center
-    distance_from_center = abs(price - center) / center
+    # Normalize position within grid (0 = bottom, 1 = top)
+    range_pos = (price - lower) / (upper - lower)
 
     # -----------------------------
-    # Case 1: price inside active grid
+    # Inside grid behavior
     # -----------------------------
     if lower <= price <= upper:
-        if price > center:
-            position = (price - center) / (upper - center) if (upper - center) != 0 else 0
-        else:
-            position = (center - price) / (center - lower) if (center - lower) != 0 else 0
 
-        # Well inside grid: default sticky HOLD
-        if position <= 0.60:
-            # Very conservative override:
-            # only replace if regime changed AND candidate is materially better
-            if candidate_regime != active_regime and candidate_score >= active_score + 1.0:
-                return "REPLACE", "inside_grid_but_regime_changed_and_candidate_materially_better"
+        # Centered → HOLD
+        if 0.30 <= range_pos <= 0.70:
+            return "HOLD", "well_centered"
 
-            return "HOLD", "price_well_inside_active_grid"
+        # Drifting but not extreme → HOLD
+        if 0.20 <= range_pos < 0.30 or 0.70 < range_pos <= 0.80:
+            return "HOLD", "mild_drift"
 
-        # Near edge, but not necessarily broken
-        if position > 0.85:
-            # If still strong context, recenter instead of churn
-            if active_regime == "RANGE_GOOD" and active_score >= 7.5:
-                return "RECENTER", "active_grid_near_edge_but_still_viable"
+        # Near edge → RECENTER
+        if 0.10 <= range_pos < 0.20 or 0.80 < range_pos <= 0.90:
+            return "RECENTER", "approaching_edge"
 
-            # If latest candidate is materially better, replace
-            if candidate_score >= active_score + 1.0:
-                return "REPLACE", "new_candidate_materially_better_than_active_grid"
+        # Extreme edge → consider replace
+        if range_pos < 0.10 or range_pos > 0.90:
+            if candidate_score >= active_score:
+                return "REPLACE", "edge_new_candidate"
+            return "RECENTER", "edge_recenter"
 
-            return "HOLD", "inside_grid_but_no_strong_case_to_change"
-
-        # Mid-zone inside grid
-        return "HOLD", "price_inside_active_grid"
+        return "HOLD", "inside_grid"
 
     # -----------------------------
-    # Case 2: price outside active grid
+    # Outside grid behavior
     # -----------------------------
     escape_distance = abs(price - center) / center
 
-    # Mild escape, still salvageable
-    if escape_distance <= 0.015 and active_regime == "RANGE_GOOD":
-        return "RECENTER", "mild_escape_from_active_grid_but_context_still_good"
+    if escape_distance <= 0.015:
+        return "RECENTER", "mild_escape"
 
-    # Moderate escape → consider replacement
     if escape_distance <= 0.025:
         if candidate_score >= active_score:
-            return "REPLACE", "moderate_escape_and_new_candidate_viable"
-        return "RECENTER", "moderate_escape_but_no_better_candidate"
+            return "REPLACE", "moderate_escape_new_candidate"
+        return "RECENTER", "moderate_escape"
 
-    # Strong escape → likely broken, but allow replacement if a clearly better candidate exists
-    if escape_distance > 0.025:
-        if candidate_score >= active_score + 1.0:
-            return "REPLACE", "strong_escape_but_new_candidate_materially_better"
-        return "EXIT", "strong_breakout_from_active_grid"
+    if candidate_score >= active_score + 1.0:
+        return "REPLACE", "strong_escape_better_candidate"
 
-    return "HOLD", "default_fallback"
+    return "EXIT", "strong_breakout"
 
 
 # -----------------------------
-# Active grid builders
+# Write lifecycle fields back to decision_history.csv
 # -----------------------------
-def build_active_grid(candidate, price_timestamp):
-    return {
-        "grid_id": f"xrp_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        "active": True,
-        "status": "ACTIVE",
-        "initiated_at": str(pd.Timestamp.utcnow()),
-        "last_reviewed_at": str(pd.Timestamp.utcnow()),
-        "price_timestamp": price_timestamp,
-        "grid_lower": float(candidate["grid_lower"]),
-        "grid_upper": float(candidate["grid_upper"]),
-        "center_price": float(candidate["center_price"]),
-        "candidate_score": float(candidate["candidate_score"]),
-        "operational_regime": candidate["operational_regime"],
-        "last_action": "INITIATE",
-        "last_action_reason": "new_active_grid_created",
-        "bars_since_initiation": 0,
-        "bars_outside_grid": 0,
-        "bars_near_edge": 0
-    }
+def _stamp_lifecycle_to_history(output: dict):
+    """
+    Update the most-recent row in decision_history.csv with the lifecycle
+    fields computed this cycle.  Called after lifecycle output is finalised
+    so evaluate.py can read them directly from decision_history.csv.
+    """
+    if not Path(DECISION_HISTORY_PATH).exists():
+        return
 
+    history = pd.read_csv(DECISION_HISTORY_PATH)
+    if history.empty:
+        return
 
-def update_active_grid_after_action(active_grid, candidate, action, reason, price_timestamp):
-    now = str(pd.Timestamp.utcnow())
+    # Target: the row with the latest timestamp (the one run.py just appended).
+    latest_idx = history.index[-1]
 
-    if action == "HOLD":
-        active_grid["last_reviewed_at"] = now
-        active_grid["price_timestamp"] = price_timestamp
-        active_grid["last_action"] = "HOLD"
-        active_grid["last_action_reason"] = reason
-        return active_grid
+    history.loc[latest_idx, "lifecycle_action"] = output.get("lifecycle_action")
+    history.loc[latest_idx, "lifecycle_mode"]   = output.get("mode")
+    history.loc[latest_idx, "lifecycle_reason"] = output.get("reason")
 
-    if action in ["RECENTER", "REPLACE"]:
-        active_grid["last_reviewed_at"] = now
-        active_grid["price_timestamp"] = price_timestamp
-        active_grid["grid_lower"] = float(candidate["grid_lower"])
-        active_grid["grid_upper"] = float(candidate["grid_upper"])
-        active_grid["center_price"] = float(candidate["center_price"])
-        active_grid["candidate_score"] = float(candidate["candidate_score"])
-        active_grid["operational_regime"] = candidate["operational_regime"]
-        active_grid["last_action"] = action
-        active_grid["last_action_reason"] = reason
-        return active_grid
+    history.to_csv(DECISION_HISTORY_PATH, index=False)
 
-    if action == "EXIT":
-        return {
-            "active": False,
-            "status": "EXITED",
-            "exited_at": now,
-            "last_action": "EXIT",
-            "last_action_reason": reason
-        }
-
-    return active_grid
+    # Verify the stamp landed — fail loudly rather than silently producing NULLs.
+    verify = pd.read_csv(DECISION_HISTORY_PATH)
+    if pd.isna(verify.iloc[latest_idx]["lifecycle_action"]):
+        raise RuntimeError(
+            f"lifecycle stamp failed: row {latest_idx} still has NULL lifecycle_action"
+        )
 
 
 # -----------------------------
-# Main
+# MAIN
 # -----------------------------
 def main():
     candidate = load_latest_decision()
-    price, price_timestamp = load_latest_price()
-    active_grid = load_active_grid()
+    price, ts = load_latest_price()
+
+    active_grid   = load_active_grid()
+    paper_summary = load_paper_summary() if active_grid else None
 
     if active_grid is None:
-        action, reason = determine_initiation_action(candidate, price)
+        proposed_action, proposed_reason = determine_initiation_action(candidate, price)
+        action, reason, _ = control_apply(proposed_action, proposed_reason, None, price)
 
         if action == "INITIATE":
-            new_active_grid = build_active_grid(candidate, price_timestamp)
-            save_active_grid(new_active_grid)
-        else:
-            clear_active_grid()
+            from src.control.control_layer import REPLACE_COOLDOWN_BARS, RECENTER_COOLDOWN_BARS
+            new_grid = {
+                "grid_id": f"xrp_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}",
+                "active": True,
+                "status": "ACTIVE",
+                "initiated_at": str(pd.Timestamp.utcnow()),
+                "last_reviewed_at": str(pd.Timestamp.utcnow()),
+                "price_timestamp": ts,
+                "grid_lower": float(candidate["grid_lower"]),
+                "grid_upper": float(candidate["grid_upper"]),
+                "center_price": float(candidate["center_price"]),
+                "candidate_score": float(candidate["candidate_score"]),
+                "operational_regime": candidate["operational_regime"],
+                "last_action": action,
+                "last_action_reason": reason,
+                "bars_since_initiation": 0,
+                "bars_outside_grid": 0,
+                "bars_near_edge": 0,
+                # Cooldowns start as already elapsed on a fresh grid after EXIT.
+                "bars_since_last_replace": REPLACE_COOLDOWN_BARS,
+                "bars_since_last_recenter": RECENTER_COOLDOWN_BARS,
+            }
+            save_active_grid(new_grid)
 
         output = {
-            "timestamp": str(pd.Timestamp.utcnow()),
-            "mode": "INITIATION",
-            "price": price,
+            "mode": "INIT",
             "lifecycle_action": action,
             "reason": reason,
-            "candidate_grid_lower": float(candidate["grid_lower"]),
-            "candidate_grid_upper": float(candidate["grid_upper"]),
-            "candidate_center_price": float(candidate["center_price"]),
-            "candidate_score": float(candidate["candidate_score"]),
-            "candidate_regime": candidate["operational_regime"],
-            "active_grid_exists": False
+            "tradable": bool(candidate.get("tradable", True)),
         }
 
     else:
-        action, reason = determine_maintenance_action(active_grid, candidate, price)
-        updated_active_grid = update_active_grid_after_action(active_grid, candidate, action, reason, price_timestamp)
+        proposed_action, proposed_reason = determine_maintenance_action(active_grid, candidate, price)
+        action, reason, updated_grid = control_apply(proposed_action, proposed_reason, active_grid, price)
 
-        if updated_active_grid.get("active", False):
-            save_active_grid(updated_active_grid)
-        else:
+        eco_override = check_economic_override(action, active_grid, paper_summary, price)
+        eco_applied  = eco_override is not None
+        if eco_applied:
+            action, reason = eco_override
+
+        updated_grid["last_reviewed_at"] = str(pd.Timestamp.utcnow())
+        updated_grid["price_timestamp"] = ts
+        updated_grid["last_action"] = action
+        updated_grid["last_action_reason"] = reason
+
+        if action == "REPLACE":
+            from src.control.control_layer import RECENTER_COOLDOWN_BARS
+            new_grid = {
+                "grid_id": f"xrp_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}",
+                "active": True,
+                "status": "ACTIVE",
+                "initiated_at": str(pd.Timestamp.utcnow()),
+                "last_reviewed_at": str(pd.Timestamp.utcnow()),
+                "price_timestamp": ts,
+                "grid_lower": float(candidate["grid_lower"]),
+                "grid_upper": float(candidate["grid_upper"]),
+                "center_price": float(candidate["center_price"]),
+                "candidate_score": float(candidate["candidate_score"]),
+                "operational_regime": candidate["operational_regime"],
+                "last_action": action,
+                "last_action_reason": reason,
+                "bars_since_initiation": 0,
+                "bars_outside_grid": 0,
+                "bars_near_edge": 0,
+                # Replace cooldown starts fresh — this is the reset point.
+                # Recenter cooldown starts as elapsed so the new grid can RECENTER immediately.
+                "bars_since_last_replace": 0,
+                "bars_since_last_recenter": RECENTER_COOLDOWN_BARS,
+            }
+            save_active_grid(new_grid)
+
+        elif action == "EXIT":
             clear_active_grid()
 
+        else:
+            # HOLD and RECENTER: persist the counter-updated grid state.
+            save_active_grid(updated_grid)
+
         output = {
-            "timestamp": str(pd.Timestamp.utcnow()),
-            "mode": "MAINTENANCE",
-            "price": price,
+            "mode": "MAINTAIN",
             "lifecycle_action": action,
             "reason": reason,
-            "active_grid_id": active_grid.get("grid_id"),
-            "active_grid_lower": float(active_grid["grid_lower"]),
-            "active_grid_upper": float(active_grid["grid_upper"]),
-            "active_center_price": float(active_grid["center_price"]),
-            "active_candidate_score": float(active_grid["candidate_score"]),
-            "active_regime": active_grid["operational_regime"],
-            "latest_candidate_score": float(candidate["candidate_score"]),
-            "latest_candidate_regime": candidate["operational_regime"],
-            "active_grid_exists": True
+            "tradable": bool(candidate.get("tradable", True)),
+            "economic_override": reason if eco_applied else None,
+            "economic_override_applied": eco_applied,
         }
 
-    # Save JSON
     with open(OUTPUT_JSON, "w") as f:
         json.dump(output, f, indent=2)
 
-    # Save CSV
     pd.DataFrame([output]).to_csv(OUTPUT_CSV, index=False)
 
-    # Attach lifecycle decision to the matching decision_history row
-    attach_lifecycle_to_decision_history(candidate, output)
+    _stamp_lifecycle_to_history(output)
 
-    print(f"Lifecycle decision → {output['mode']} | {output['lifecycle_action']} ({output['reason']})")
+    print(f"LIFECYCLE → {output['lifecycle_action']} ({output['reason']})")
 
 
 if __name__ == "__main__":

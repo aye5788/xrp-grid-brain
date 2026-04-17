@@ -9,10 +9,12 @@ from google.oauth2.service_account import Credentials
 SERVICE_ACCOUNT_FILE = "credentials/google_sheets_service_account.json"
 SPREADSHEET_NAME = "XRP Grid Brain Monitor"
 
+# ✅ FIXED: Sheet1 now uses FULL history (not latest snapshot)
 SHEET_CONFIG = [
-    ("Sheet1", "outputs/latest_decision.csv"),
-    ("Evaluation", "outputs/evaluation_history.csv"),
+    ("Sheet1", "outputs/decision_history.csv"),          # FULL timeline
+    ("Evaluation", "outputs/evaluation_history.csv"),    # lagging eval
     ("Summary", "outputs/eval_summary_latest.csv"),
+    ("Paper_Summary", "outputs/paper_summary_latest.csv"),
 ]
 
 SCOPES = [
@@ -53,6 +55,16 @@ def load_csv(path):
     return df
 
 
+def clean_dataframe(df):
+    # ✅ Prevent duplicate timestamps from ever polluting sheet again
+    if "timestamp" in df.columns:
+        df["timestamp"] = df["timestamp"].astype(str)
+        df = df.drop_duplicates(subset=["timestamp"])
+        df = df.sort_values("timestamp")
+
+    return df
+
+
 def get_or_create_worksheet(spreadsheet, title, rows=1000, cols=50):
     try:
         ws = spreadsheet.worksheet(title)
@@ -62,6 +74,8 @@ def get_or_create_worksheet(spreadsheet, title, rows=1000, cols=50):
 
 
 def upload_df_to_sheet(spreadsheet, sheet_name, df):
+    df = clean_dataframe(df)
+
     ws = get_or_create_worksheet(
         spreadsheet,
         sheet_name,
@@ -74,7 +88,7 @@ def upload_df_to_sheet(spreadsheet, sheet_name, df):
     values = [df.columns.tolist()] + df.astype(str).values.tolist()
     ws.update(values)
 
-    print(f"Updated Google Sheet tab: {sheet_name}")
+    print(f"Updated Google Sheet tab: {sheet_name} ({len(df)} rows)")
 
 
 # -----------------------------
